@@ -1,0 +1,60 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+prebuilds/
+*.tsbuildinfo
+
+# Packaged artifacts
+*.tgz
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Test and coverage output
+coverage/
+.nyc_output/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.code-workspace
+
+# Visual Studio and MSBuild artifacts
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+*.vcxproj.user
+*.obj
+*.iobj
+*.ipdb
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local caches
+.cache/
+.eslintcache
+

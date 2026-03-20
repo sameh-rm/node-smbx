@@ -1,0 +1,55 @@
+{
+  "name": "node-smbx",
+  "version": "0.1.0",
+  "description": "Low-level Node-API SMB binding backed by libsmb2.",
+  "license": "MIT AND LGPL-2.1-or-later",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "prebuilds/",
+    "native/",
+    "deps/libsmb2/include/",
+    "deps/libsmb2/lib/",
+    "deps/libsmb2/COPYING",
+    "binding.gyp",
+    "LICENSE",
+    "LGPL-2.1-LICENSE",
+    "LINKING.md",
+    "README.md",
+    "docs/"
+  ],
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "build:ts": "tsc -p tsconfig.json",
+    "build:native": "node-gyp rebuild",
+    "build": "npm run clean && npm run build:ts && npm run build:native",
+    "prepare": "npm run build",
+    "prepack": "npm run build && node scripts/pack-check.mjs",
+    "install": "node-gyp-build",
+    "test": "npm run build && node --test test/unit/path.test.mjs test/unit/errors.test.mjs test/unit/module.test.mjs test/integration/smb.test.mjs",
+    "pack:check": "node scripts/pack-check.mjs",
+    "smoke:local-install": "node scripts/smoke-local-install.mjs",
+    "smoke:tarball-install": "node scripts/smoke-tarball-install.mjs"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.3.0",
+    "node-gyp-build": "^4.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.76",
+    "node-gyp": "^11.2.0",
+    "typescript": "^5.8.2"
+  }
+}
