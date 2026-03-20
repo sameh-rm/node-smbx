@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 
+import { runNpm } from "./npm-run.mjs";
+
 const root = resolve(".");
 const tempDir = await mkdtemp(join(tmpdir(), "node-smbx-local-"));
 
@@ -35,8 +37,8 @@ try {
     ].join("\n")
   );
 
-  execFileSync("cmd", ["/c", "npm.cmd", "install"], { cwd: tempDir, stdio: "inherit" });
-  execFileSync("node", ["index.mjs"], { cwd: tempDir, stdio: "inherit" });
+  runNpm(["install"], { cwd: tempDir });
+  execFileSync(process.execPath, ["index.mjs"], { cwd: tempDir, stdio: "inherit" });
 } finally {
   await rm(tempDir, { force: true, recursive: true });
 }

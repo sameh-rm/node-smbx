@@ -3,11 +3,13 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 
+import { runNpm } from "./npm-run.mjs";
+
 const root = resolve(".");
 const tempDir = await mkdtemp(join(tmpdir(), "node-smbx-tarball-"));
 
 try {
-  execFileSync("cmd", ["/c", "npm.cmd", "pack"], { cwd: root, stdio: "inherit" });
+  runNpm(["pack"], { cwd: root });
   const tarballs = (await readdir(root)).filter((entry) => entry.endsWith(".tgz"));
   if (tarballs.length === 0) {
     throw new Error("npm pack did not produce a tarball");
@@ -40,8 +42,8 @@ try {
     ].join("\n")
   );
 
-  execFileSync("cmd", ["/c", "npm.cmd", "install", tarball], { cwd: tempDir, stdio: "inherit" });
-  execFileSync("node", ["index.mjs"], { cwd: tempDir, stdio: "inherit" });
+  runNpm(["install", tarball], { cwd: tempDir });
+  execFileSync(process.execPath, ["index.mjs"], { cwd: tempDir, stdio: "inherit" });
 } finally {
   await rm(tempDir, { force: true, recursive: true });
   const tarballs = (await readdir(root)).filter((entry) => entry.endsWith(".tgz"));

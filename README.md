@@ -2,6 +2,17 @@
 
 Low-level TypeScript SMB binding backed by `libsmb2`.
 
+## Platform Support
+
+The package is intended to build and run on:
+
+- Windows
+- Linux
+- macOS
+
+Consumers currently build the native addon for their local platform during
+install unless a matching prebuild is provided later.
+
 ## Status
 
 This repository is being bootstrapped around a Node-API addon that wraps `libsmb2`.
@@ -16,6 +27,12 @@ Prerequisites:
 - Node.js `>=18.17.0`
 - A working native build toolchain for Node addons
 - Network access to an SMB server for integration testing
+
+Platform notes:
+
+- Windows: Visual Studio Build Tools for `node-gyp`
+- Linux: GCC/Clang, `make`, and Python
+- macOS: Xcode Command Line Tools and Python
 
 Install dependencies and build:
 

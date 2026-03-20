@@ -18,6 +18,9 @@ From a local checkout:
 npm install ../node-smbx
 ```
 
+Local path installs build the addon for the current machine, so the same package
+source can be installed on Windows, Linux, or macOS and compile for that target.
+
 ## Import
 
 ```ts

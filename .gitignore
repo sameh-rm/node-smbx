@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+deps/libsmb2/
 
 # Build output
 dist/
@@ -57,4 +58,3 @@ Desktop.ini
 # Local caches
 .cache/
 .eslintcache
-
