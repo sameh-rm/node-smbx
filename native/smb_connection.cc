@@ -11,6 +11,8 @@
 
 namespace {
 constexpr uint64_t kServiceTickMs = 100;
+constexpr int kSmbPollIn = 0x0001;
+constexpr int kSmbPollOut = 0x0004;
 }
 
 Napi::FunctionReference SmbConnectionWrap::constructor;
@@ -152,17 +154,18 @@ std::string SmbConnectionWrap::ClassifyError(int status,
     return "SIGNING_REQUIRED";
   }
 
-  switch (nterror) {
-    case SMB2_STATUS_LOGON_FAILURE:
-      return "AUTH";
-    case SMB2_STATUS_IO_TIMEOUT:
-      return "TIMEOUT";
-    case SMB2_STATUS_OBJECT_NAME_NOT_FOUND:
-      return "NOT_FOUND";
-    case SMB2_STATUS_OBJECT_NAME_COLLISION:
-      return "ALREADY_EXISTS";
-    default:
-      break;
+  const uint32_t ntstatus = static_cast<uint32_t>(nterror);
+  if (ntstatus == static_cast<uint32_t>(SMB2_STATUS_LOGON_FAILURE)) {
+    return "AUTH";
+  }
+  if (ntstatus == static_cast<uint32_t>(SMB2_STATUS_IO_TIMEOUT)) {
+    return "TIMEOUT";
+  }
+  if (ntstatus == static_cast<uint32_t>(SMB2_STATUS_OBJECT_NAME_NOT_FOUND)) {
+    return "NOT_FOUND";
+  }
+  if (ntstatus == static_cast<uint32_t>(SMB2_STATUS_OBJECT_NAME_COLLISION)) {
+    return "ALREADY_EXISTS";
   }
 
   switch (status) {
@@ -268,10 +271,10 @@ void SmbConnectionWrap::ApplyPollEvents() {
   }
 
   int uv_events = 0;
-  if ((poll_events_ & POLLIN) != 0) {
+  if ((poll_events_ & kSmbPollIn) != 0) {
     uv_events |= UV_READABLE;
   }
-  if ((poll_events_ & POLLOUT) != 0) {
+  if ((poll_events_ & kSmbPollOut) != 0) {
     uv_events |= UV_WRITABLE;
   }
 
@@ -363,10 +366,10 @@ void SmbConnectionWrap::OnPollEvent(uv_poll_t* handle, int status, int events) {
 
   int revents = 0;
   if ((events & UV_READABLE) != 0) {
-    revents |= POLLIN;
+    revents |= kSmbPollIn;
   }
   if ((events & UV_WRITABLE) != 0) {
-    revents |= POLLOUT;
+    revents |= kSmbPollOut;
   }
 
   if (revents == 0) {
