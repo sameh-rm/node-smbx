@@ -116,6 +116,10 @@ bool SmbConnectionWrap::IsConnectionReady() const {
   return context_ != nullptr && connected_ && !disconnecting_;
 }
 
+bool SmbConnectionWrap::IsConnectionClosing() const {
+  return context_ == nullptr || disconnecting_;
+}
+
 Napi::Value SmbConnectionWrap::RejectNotReady(Napi::Env env) const {
   auto deferred = Napi::Promise::Deferred::New(env);
   deferred.Reject(CreateError("INVALID_STATE", "Connection is not ready", -EINVAL, 0));
@@ -786,6 +790,11 @@ void SmbConnectionWrap::OnReadComplete(struct smb2_context* smb2, int status, vo
     owner->FinishPending(operation);
     return;
   }
+  if (owner->IsConnectionClosing()) {
+    owner->RejectPending(operation, "CONNECTION", "Connection closed", -ECONNRESET, 0);
+    owner->FinishPending(operation);
+    return;
+  }
   if (status < 0) {
     const std::string message = owner->LastErrorMessage();
     const int nterror = owner->LastNtError();
@@ -856,6 +865,11 @@ void SmbConnectionWrap::OnWriteComplete(struct smb2_context* smb2, int status, v
     owner->FinishPending(operation);
     return;
   }
+  if (owner->IsConnectionClosing()) {
+    owner->RejectPending(operation, "CONNECTION", "Connection closed", -ECONNRESET, 0);
+    owner->FinishPending(operation);
+    return;
+  }
   if (status < 0) {
     const std::string message = owner->LastErrorMessage();
     const int nterror = owner->LastNtError();
@@ -916,6 +930,11 @@ void SmbConnectionWrap::OnFtruncateComplete(struct smb2_context* smb2, int statu
     owner->FinishPending(operation);
     return;
   }
+  if (owner->IsConnectionClosing()) {
+    owner->RejectPending(operation, "CONNECTION", "Connection closed", -ECONNRESET, 0);
+    owner->FinishPending(operation);
+    return;
+  }
   if (status < 0) {
     const std::string message = owner->LastErrorMessage();
     const int nterror = owner->LastNtError();
@@ -968,6 +987,11 @@ void SmbConnectionWrap::OnCloseComplete(struct smb2_context* smb2, int status, v
   SmbConnectionWrap* owner = operation->owner;
   Napi::HandleScope scope(owner->Env());
   if (operation->settled) {
+    owner->FinishPending(operation);
+    return;
+  }
+  if (owner->IsConnectionClosing()) {
+    owner->RejectPending(operation, "CONNECTION", "Connection closed", -ECONNRESET, 0);
     owner->FinishPending(operation);
     return;
   }
@@ -1058,6 +1082,12 @@ void SmbConnectionWrap::OnPathComplete(struct smb2_context* smb2, int status, vo
     owner->FinishPending(operation);
     return;
   }
+  if (owner->IsConnectionClosing()) {
+    owner->RejectPending(operation, "CONNECTION", "Connection closed", -ECONNRESET, 0,
+                         operation->path.empty() ? nullptr : &operation->path);
+    owner->FinishPending(operation);
+    return;
+  }
   if (status < 0) {
     const std::string message = owner->LastErrorMessage();
     const int nterror = owner->LastNtError();
@@ -1102,6 +1132,12 @@ void SmbConnectionWrap::OnRenameComplete(struct smb2_context* smb2, int status, 
     owner->FinishPending(operation);
     return;
   }
+  if (owner->IsConnectionClosing()) {
+    owner->RejectPending(operation, "CONNECTION", "Connection closed", -ECONNRESET, 0,
+                         operation->path.empty() ? nullptr : &operation->path);
+    owner->FinishPending(operation);
+    return;
+  }
   if (status < 0) {
     const std::string message = owner->LastErrorMessage();
     const int nterror = owner->LastNtError();
@@ -1142,7 +1178,7 @@ void SmbConnectionWrap::OnOpendirComplete(struct smb2_context* smb2, int status,
   Napi::HandleScope scope(owner->Env());
   auto* handle = static_cast<smb2dir*>(command_data);
 
-  if (operation->settled || owner->disconnecting_) {
+  if (operation->settled || owner->IsConnectionClosing()) {
     if (status == 0 && handle != nullptr && owner->context_ != nullptr) {
       smb2_closedir(owner->context_, handle);
     }

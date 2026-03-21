@@ -91,6 +91,7 @@ private:
 
   bool EnsureContext();
   bool IsConnectionReady() const;
+  bool IsConnectionClosing() const;
   Napi::Value RejectNotReady(Napi::Env env) const;
   void RegisterPending(PendingOperation* operation);
   void FinishPending(PendingOperation* operation);
