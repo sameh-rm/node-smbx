@@ -1,6 +1,6 @@
 {
   "name": "node-smbx",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Low-level Node-API SMB binding backed by libsmb2.",
   "license": "MIT AND LGPL-2.1-or-later",
   "type": "module",
