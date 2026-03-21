@@ -106,9 +106,18 @@ test("SmbConnection normalizes share-relative paths before calling native method
 test("SmbConnection validates bigint offsets and lengths on the JS boundary", () => {
   const { connection } = createFakeNative();
 
-  assert.throws(() => connection.read(1, -1n, 16), /offset must be non-negative/);
-  assert.throws(() => connection.ftruncate(1, -1n), /length must be non-negative/);
-  assert.throws(() => connection.read(1, 0n, -1), /length must be a non-negative integer/);
+  assert.throws(
+    () => connection.read(1, -1n, 16),
+    (error) => error instanceof SmbInvalidStateError
+  );
+  assert.throws(
+    () => connection.ftruncate(1, -1n),
+    (error) => error instanceof SmbInvalidStateError
+  );
+  assert.throws(
+    () => connection.read(1, 0n, -1),
+    (error) => error instanceof SmbInvalidStateError
+  );
 });
 
 test("SmbConnection maps native invalid-state failures to typed JS errors", async () => {

@@ -83,14 +83,18 @@ SmbConnectionWrap::SmbConnectionWrap(const Napi::CallbackInfo& info)
       poll_state_(nullptr),
       service_timer_{},
       service_timer_initialized_(false),
+      cleanup_context_pending_(false),
+      cleanup_ref_held_(false),
       file_handles_(),
       dir_handles_(),
       next_file_handle_(1),
       next_dir_handle_(1),
-      pending_() {}
+      pending_(),
+      deferred_cleanup_operations_() {}
 
 SmbConnectionWrap::~SmbConnectionWrap() {
   CleanupContext();
+  DrainDeferredCleanupOperations();
 }
 
 bool SmbConnectionWrap::EnsureContext() {
@@ -126,10 +130,14 @@ Napi::Value SmbConnectionWrap::RejectNotReady(Napi::Env env) const {
   return deferred.Promise();
 }
 
-void SmbConnectionWrap::RegisterPending(PendingOperation* operation) {
+bool SmbConnectionWrap::RegisterPending(PendingOperation* operation) {
   pending_.insert(operation);
-  StartServiceTimer();
   Ref();
+  if (!StartServiceTimer()) {
+    HandleFatal("Failed to start SMB service timer");
+    return false;
+  }
+  return true;
 }
 
 void SmbConnectionWrap::FinishPending(PendingOperation* operation) {
@@ -138,7 +146,14 @@ void SmbConnectionWrap::FinishPending(PendingOperation* operation) {
     pending_.erase(it);
     Unref();
   }
-  if (pending_.empty()) {
+  auto deferredIt = std::find(
+      deferred_cleanup_operations_.begin(),
+      deferred_cleanup_operations_.end(),
+      operation);
+  if (deferredIt != deferred_cleanup_operations_.end()) {
+    deferred_cleanup_operations_.erase(deferredIt);
+  }
+  if (pending_.empty() && !cleanup_context_pending_) {
     StopServiceTimer();
   }
   delete operation;
@@ -244,6 +259,44 @@ void SmbConnectionWrap::RejectAllPending(const std::string& code, const std::str
   }
 }
 
+void SmbConnectionWrap::QueuePendingForCleanup(PendingOperation* keep) {
+  std::vector<PendingOperation*> operations;
+  operations.reserve(pending_.size());
+  for (PendingOperation* operation : pending_) {
+    if (operation == keep) {
+      continue;
+    }
+    operations.push_back(operation);
+  }
+  for (PendingOperation* operation : operations) {
+    if (!operation->settled) {
+      RejectPending(
+          operation,
+          "CONNECTION",
+          "Connection closed",
+          -ECONNRESET,
+          0,
+          operation->path.empty() ? nullptr : &operation->path);
+    }
+    auto it = pending_.find(operation);
+    if (it != pending_.end()) {
+      pending_.erase(it);
+      Unref();
+    }
+    deferred_cleanup_operations_.push_back(operation);
+  }
+  if (pending_.empty() && !cleanup_context_pending_) {
+    StopServiceTimer();
+  }
+}
+
+void SmbConnectionWrap::DrainDeferredCleanupOperations() {
+  for (PendingOperation* operation : deferred_cleanup_operations_) {
+    delete operation;
+  }
+  deferred_cleanup_operations_.clear();
+}
+
 void SmbConnectionWrap::StartPoll(t_socket fd) {
   if (poll_state_ != nullptr && poll_state_->fd == fd) {
     return;
@@ -252,7 +305,10 @@ void SmbConnectionWrap::StartPoll(t_socket fd) {
   StopPoll();
 
   uv_loop_t* loop = nullptr;
-  napi_get_uv_event_loop(Env(), &loop);
+  if (napi_get_uv_event_loop(Env(), &loop) != napi_ok || loop == nullptr) {
+    HandleFatal("Failed to get uv event loop for SMB socket");
+    return;
+  }
   auto* state = new PollState{};
   state->owner = this;
   state->fd = fd;
@@ -297,19 +353,57 @@ void SmbConnectionWrap::ApplyPollEvents() {
     return;
   }
 
-  uv_poll_start(&poll_state_->handle, uv_events, &SmbConnectionWrap::OnPollEvent);
+  const int rc =
+      uv_poll_start(&poll_state_->handle, uv_events, &SmbConnectionWrap::OnPollEvent);
+  if (rc != 0) {
+    HandleFatal("Failed to start uv_poll for SMB socket");
+  }
 }
 
-void SmbConnectionWrap::StartServiceTimer() {
+bool SmbConnectionWrap::EnsureServiceTimerInitialized() {
   uv_loop_t* loop = nullptr;
-  napi_get_uv_event_loop(Env(), &loop);
+  if (napi_get_uv_event_loop(Env(), &loop) != napi_ok || loop == nullptr) {
+    return false;
+  }
   if (!service_timer_initialized_) {
-    uv_timer_init(loop, &service_timer_);
+    const int initRc = uv_timer_init(loop, &service_timer_);
+    if (initRc != 0) {
+      return false;
+    }
     service_timer_.data = this;
     service_timer_initialized_ = true;
   }
+  return true;
+}
 
-  uv_timer_start(&service_timer_, &SmbConnectionWrap::OnServiceTimer, kServiceTickMs, kServiceTickMs);
+bool SmbConnectionWrap::StartServiceTimer() {
+  if (!EnsureServiceTimerInitialized()) {
+    return false;
+  }
+  const int startRc = uv_timer_start(
+      &service_timer_, &SmbConnectionWrap::OnServiceTimer, kServiceTickMs, kServiceTickMs);
+  return startRc == 0;
+}
+
+bool SmbConnectionWrap::ScheduleDeferredCleanup() {
+  if (!EnsureServiceTimerInitialized()) {
+    return false;
+  }
+  cleanup_context_pending_ = true;
+  if (!cleanup_ref_held_) {
+    Ref();
+    cleanup_ref_held_ = true;
+  }
+  const int startRc = uv_timer_start(&service_timer_, &SmbConnectionWrap::OnServiceTimer, 0, 0);
+  if (startRc != 0) {
+    cleanup_context_pending_ = false;
+    if (cleanup_ref_held_) {
+      Unref();
+      cleanup_ref_held_ = false;
+    }
+    return false;
+  }
+  return true;
 }
 
 void SmbConnectionWrap::StopServiceTimer() {
@@ -325,6 +419,7 @@ void SmbConnectionWrap::CleanupContext() {
 
   file_handles_.clear();
   dir_handles_.clear();
+  cleanup_context_pending_ = false;
 
   if (context_ != nullptr) {
     contexts_.erase(context_);
@@ -339,7 +434,9 @@ void SmbConnectionWrap::CleanupContext() {
 
 void SmbConnectionWrap::HandleFatal(const std::string& message) {
   RejectAllPending("CONNECTION", message);
+  QueuePendingForCleanup();
   CleanupContext();
+  DrainDeferredCleanupOperations();
 }
 
 void SmbConnectionWrap::OnFdChanged(struct smb2_context* smb2, t_socket fd, int cmd) {
@@ -404,10 +501,22 @@ void SmbConnectionWrap::OnPollClosed(uv_handle_t* handle) {
 
 void SmbConnectionWrap::OnServiceTimer(uv_timer_t* handle) {
   auto* owner = static_cast<SmbConnectionWrap*>(handle->data);
-  if (owner == nullptr || owner->context_ == nullptr) {
+  if (owner == nullptr) {
     return;
   }
   Napi::HandleScope scope(owner->Env());
+  if (owner->cleanup_context_pending_) {
+    owner->CleanupContext();
+    owner->DrainDeferredCleanupOperations();
+    if (owner->cleanup_ref_held_) {
+      owner->cleanup_ref_held_ = false;
+      owner->Unref();
+    }
+    return;
+  }
+  if (owner->context_ == nullptr) {
+    return;
+  }
   if (smb2_service(owner->context_, 0) < 0) {
     owner->HandleFatal(owner->LastErrorMessage());
   }
@@ -541,7 +650,9 @@ Napi::Value SmbConnectionWrap::Connect(const Napi::CallbackInfo& info) {
       : static_cast<uint16_t>(SMB2_NEGOTIATE_SIGNING_ENABLED);
   smb2_set_security_mode(owner->context_, securityMode);
 
-  owner->RegisterPending(operation);
+  if (!owner->RegisterPending(operation)) {
+    return operation->deferred.Promise();
+  }
   const int rc = smb2_connect_share_async(owner->context_, serverAddress.c_str(), share.c_str(), username.c_str(), &SmbConnectionWrap::OnConnectComplete, operation);
   if (rc < 0) {
     const std::string message = owner->LastErrorMessage();
@@ -595,7 +706,9 @@ Napi::Value SmbConnectionWrap::Disconnect(const Napi::CallbackInfo& info) {
 
   disconnecting_ = true;
   RejectAllPending("CONNECTION", "Connection closed");
-  RegisterPending(operation);
+  if (!RegisterPending(operation)) {
+    return operation->deferred.Promise();
+  }
 
   const int rc = smb2_disconnect_share_async(context_, &SmbConnectionWrap::OnDisconnectComplete, operation);
   if (rc < 0) {
@@ -611,23 +724,34 @@ Napi::Value SmbConnectionWrap::Disconnect(const Napi::CallbackInfo& info) {
 
 void SmbConnectionWrap::OnDisconnectComplete(struct smb2_context* smb2, int status, void* command_data, void* cb_data) {
   (void)smb2;
-  (void)status;
   (void)command_data;
   auto* operation = static_cast<PendingOperation*>(cb_data);
   SmbConnectionWrap* owner = operation->owner;
   Napi::HandleScope scope(owner->Env());
+
+  if (!operation->settled && status < 0) {
+    const std::string message = owner->LastErrorMessage();
+    const int nterror = owner->LastNtError();
+    owner->RejectPending(
+        operation,
+        owner->ClassifyError(status, nterror, message),
+        message,
+        status,
+        nterror);
+  } else if (!operation->settled) {
+    operation->deferred.Resolve(owner->Env().Undefined());
+    operation->settled = true;
+  }
+
   owner->StopPoll();
-  owner->StopServiceTimer();
   owner->file_handles_.clear();
   owner->dir_handles_.clear();
   owner->connected_ = false;
   owner->disconnecting_ = false;
   owner->poll_events_ = 0;
-  if (!operation->settled) {
-    operation->deferred.Resolve(owner->Env().Undefined());
-    operation->settled = true;
-  }
+  owner->QueuePendingForCleanup(operation);
   owner->FinishPending(operation);
+  owner->ScheduleDeferredCleanup();
 }
 
 Napi::Value SmbConnectionWrap::Stat(const Napi::CallbackInfo& info) {
@@ -642,7 +766,9 @@ Napi::Value SmbConnectionWrap::Stat(const Napi::CallbackInfo& info) {
 
   auto* operation = new StatOperation(this);
   operation->path = info[0].As<Napi::String>().Utf8Value();
-  RegisterPending(operation);
+  if (!RegisterPending(operation)) {
+    return operation->deferred.Promise();
+  }
   const int rc = smb2_stat_async(context_, operation->path.c_str(), &operation->stat, &SmbConnectionWrap::OnStatComplete, operation);
   if (rc < 0) {
     const std::string message = LastErrorMessage();
@@ -690,7 +816,9 @@ Napi::Value SmbConnectionWrap::Open(const Napi::CallbackInfo& info) {
   auto* operation = new OpenOperation(this);
   operation->path = info[0].As<Napi::String>().Utf8Value();
   const int flags = info[1].As<Napi::Number>().Int32Value();
-  RegisterPending(operation);
+  if (!RegisterPending(operation)) {
+    return operation->deferred.Promise();
+  }
   const int rc = smb2_open_async(context_, operation->path.c_str(), flags, &SmbConnectionWrap::OnOpenComplete, operation);
   if (rc < 0) {
     const std::string message = LastErrorMessage();
@@ -768,7 +896,9 @@ Napi::Value SmbConnectionWrap::Read(const Napi::CallbackInfo& info) {
 
   auto* operation = new ReadOperation(this);
   operation->buffer.resize(length);
-  RegisterPending(operation);
+  if (!RegisterPending(operation)) {
+    return operation->deferred.Promise();
+  }
   const int rc = smb2_pread_async(context_, handleIt->second.handle, operation->buffer.data(), length, offset, &SmbConnectionWrap::OnReadComplete, operation);
   if (rc < 0) {
     const std::string message = LastErrorMessage();
@@ -843,7 +973,9 @@ Napi::Value SmbConnectionWrap::Write(const Napi::CallbackInfo& info) {
 
   auto* operation = new WriteOperation(this);
   operation->buffer.assign(data.Data(), data.Data() + data.ByteLength());
-  RegisterPending(operation);
+  if (!RegisterPending(operation)) {
+    return operation->deferred.Promise();
+  }
   const int rc = smb2_pwrite_async(context_, handleIt->second.handle, operation->buffer.data(), static_cast<uint32_t>(operation->buffer.size()), offset, &SmbConnectionWrap::OnWriteComplete, operation);
   if (rc < 0) {
     const std::string message = LastErrorMessage();
@@ -909,7 +1041,9 @@ Napi::Value SmbConnectionWrap::Ftruncate(const Napi::CallbackInfo& info) {
   }
 
   auto* operation = new HandleOperation(this, handleId);
-  RegisterPending(operation);
+  if (!RegisterPending(operation)) {
+    return operation->deferred.Promise();
+  }
   const int rc = smb2_ftruncate_async(context_, handleIt->second.handle, length, &SmbConnectionWrap::OnFtruncateComplete, operation);
   if (rc < 0) {
     const std::string message = LastErrorMessage();
@@ -969,7 +1103,9 @@ Napi::Value SmbConnectionWrap::Close(const Napi::CallbackInfo& info) {
   file_handles_.erase(handleIt);
 
   auto* operation = new HandleOperation(this, handleId);
-  RegisterPending(operation);
+  if (!RegisterPending(operation)) {
+    return operation->deferred.Promise();
+  }
   const int rc = smb2_close_async(context_, handle, &SmbConnectionWrap::OnCloseComplete, operation);
   if (rc < 0) {
     const std::string message = LastErrorMessage();
@@ -1017,7 +1153,9 @@ Napi::Value SmbConnectionWrap::Mkdir(const Napi::CallbackInfo& info) {
   }
   auto* operation = new PendingOperation(this);
   operation->path = info[0].As<Napi::String>().Utf8Value();
-  RegisterPending(operation);
+  if (!RegisterPending(operation)) {
+    return operation->deferred.Promise();
+  }
   const int rc = smb2_mkdir_async(context_, operation->path.c_str(), &SmbConnectionWrap::OnPathComplete, operation);
   if (rc < 0) {
     const std::string message = LastErrorMessage();
@@ -1039,7 +1177,9 @@ Napi::Value SmbConnectionWrap::Rmdir(const Napi::CallbackInfo& info) {
   }
   auto* operation = new PendingOperation(this);
   operation->path = info[0].As<Napi::String>().Utf8Value();
-  RegisterPending(operation);
+  if (!RegisterPending(operation)) {
+    return operation->deferred.Promise();
+  }
   const int rc = smb2_rmdir_async(context_, operation->path.c_str(), &SmbConnectionWrap::OnPathComplete, operation);
   if (rc < 0) {
     const std::string message = LastErrorMessage();
@@ -1061,7 +1201,9 @@ Napi::Value SmbConnectionWrap::Unlink(const Napi::CallbackInfo& info) {
   }
   auto* operation = new PendingOperation(this);
   operation->path = info[0].As<Napi::String>().Utf8Value();
-  RegisterPending(operation);
+  if (!RegisterPending(operation)) {
+    return operation->deferred.Promise();
+  }
   const int rc = smb2_unlink_async(context_, operation->path.c_str(), &SmbConnectionWrap::OnPathComplete, operation);
   if (rc < 0) {
     const std::string message = LastErrorMessage();
@@ -1111,7 +1253,9 @@ Napi::Value SmbConnectionWrap::Rename(const Napi::CallbackInfo& info) {
   auto* operation = new RenameOperation(this);
   operation->path = info[0].As<Napi::String>().Utf8Value();
   operation->new_path = info[1].As<Napi::String>().Utf8Value();
-  RegisterPending(operation);
+  if (!RegisterPending(operation)) {
+    return operation->deferred.Promise();
+  }
   const int rc = smb2_rename_async(context_, operation->path.c_str(), operation->new_path.c_str(), &SmbConnectionWrap::OnRenameComplete, operation);
   if (rc < 0) {
     const std::string message = LastErrorMessage();
@@ -1160,7 +1304,9 @@ Napi::Value SmbConnectionWrap::Opendir(const Napi::CallbackInfo& info) {
   }
   auto* operation = new OpenOperation(this);
   operation->path = info[0].As<Napi::String>().Utf8Value();
-  RegisterPending(operation);
+  if (!RegisterPending(operation)) {
+    return operation->deferred.Promise();
+  }
   const int rc = smb2_opendir_async(context_, operation->path.c_str(), &SmbConnectionWrap::OnOpendirComplete, operation);
   if (rc < 0) {
     const std::string message = LastErrorMessage();

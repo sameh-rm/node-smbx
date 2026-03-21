@@ -93,10 +93,12 @@ private:
   bool IsConnectionReady() const;
   bool IsConnectionClosing() const;
   Napi::Value RejectNotReady(Napi::Env env) const;
-  void RegisterPending(PendingOperation* operation);
+  bool RegisterPending(PendingOperation* operation);
   void FinishPending(PendingOperation* operation);
   void RejectPending(PendingOperation* operation, const std::string& code, const std::string& message, int status, int nterror, const std::string* path = nullptr);
   void RejectAllPending(const std::string& code, const std::string& message);
+  void QueuePendingForCleanup(PendingOperation* keep = nullptr);
+  void DrainDeferredCleanupOperations();
 
   Napi::Object CreateError(const std::string& code, const std::string& message, int status, int nterror, const std::string* path = nullptr) const;
   std::string ClassifyError(int status, int nterror, const std::string& message, bool signing_required = false) const;
@@ -106,7 +108,9 @@ private:
   void StartPoll(t_socket fd);
   void StopPoll();
   void ApplyPollEvents();
-  void StartServiceTimer();
+  bool EnsureServiceTimerInitialized();
+  bool StartServiceTimer();
+  bool ScheduleDeferredCleanup();
   void StopServiceTimer();
   void CleanupContext();
   void HandleFatal(const std::string& message);
@@ -158,11 +162,14 @@ private:
   PollState* poll_state_;
   uv_timer_t service_timer_;
   bool service_timer_initialized_;
+  bool cleanup_context_pending_;
+  bool cleanup_ref_held_;
   std::unordered_map<uint32_t, FileHandleEntry> file_handles_;
   std::unordered_map<uint32_t, DirHandleEntry> dir_handles_;
   uint32_t next_file_handle_;
   uint32_t next_dir_handle_;
   std::unordered_set<PendingOperation*> pending_;
+  std::vector<PendingOperation*> deferred_cleanup_operations_;
 
   static std::unordered_map<smb2_context*, SmbConnectionWrap*> contexts_;
 };
