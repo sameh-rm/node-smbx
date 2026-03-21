@@ -29,7 +29,33 @@ export type NativeErrorLike = Error & {
   code?: string;
   errno?: number;
   nterror?: number;
+  operation?: string;
+  durationMs?: number;
+  activeOperations?: Array<{
+    action: string;
+    path?: string;
+    newPath?: string;
+    handle?: number;
+    durationMs: number;
+    summary: string;
+  }>;
   path?: string;
+};
+
+export type PendingOperationDebug = {
+  action: string;
+  path?: string;
+  newPath?: string;
+  handle?: number;
+  durationMs: number;
+  summary: string;
+};
+
+export type ConnectionDebugState = {
+  connected: boolean;
+  disconnecting: boolean;
+  timeoutSec: number;
+  pendingOperations: PendingOperationDebug[];
 };
 
 export type NativeSmbConnection = {
@@ -47,6 +73,7 @@ export type NativeSmbConnection = {
   opendir(path: string): Promise<DirHandle>;
   readdir(handle: DirHandle): Promise<DirEntry | null>;
   closedir(handle: DirHandle): Promise<void>;
+  getDebugState(): ConnectionDebugState;
   getMaxReadSize(): number;
   getMaxWriteSize(): number;
   readonly connected: boolean;

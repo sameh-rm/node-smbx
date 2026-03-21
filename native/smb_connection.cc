@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -13,13 +15,25 @@ namespace {
 constexpr uint64_t kServiceTickMs = 100;
 constexpr int kSmbPollIn = 0x0001;
 constexpr int kSmbPollOut = 0x0004;
+
+uint64_t CurrentTimeMs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
 }
 
 Napi::FunctionReference SmbConnectionWrap::constructor;
 std::unordered_map<smb2_context*, SmbConnectionWrap*> SmbConnectionWrap::contexts_;
 
 SmbConnectionWrap::PendingOperation::PendingOperation(SmbConnectionWrap* owner_in)
-    : owner(owner_in), deferred(Napi::Promise::Deferred::New(owner_in->Env())), settled(false) {}
+    : owner(owner_in),
+      deferred(Napi::Promise::Deferred::New(owner_in->Env())),
+      settled(false),
+      started_at_ms(CurrentTimeMs()),
+      handle_id(0),
+      has_handle_id(false) {}
 
 SmbConnectionWrap::ConnectOperation::ConnectOperation(SmbConnectionWrap* owner_in)
     : PendingOperation(owner_in), signing_required(false) {}
@@ -62,6 +76,7 @@ Napi::Object SmbConnectionWrap::Init(Napi::Env env, Napi::Object exports) {
           InstanceMethod("opendir", &SmbConnectionWrap::Opendir),
           InstanceMethod("readdir", &SmbConnectionWrap::Readdir),
           InstanceMethod("closedir", &SmbConnectionWrap::Closedir),
+          InstanceMethod("getDebugState", &SmbConnectionWrap::GetDebugState),
           InstanceMethod("getMaxReadSize", &SmbConnectionWrap::GetMaxReadSize),
           InstanceMethod("getMaxWriteSize", &SmbConnectionWrap::GetMaxWriteSize),
           InstanceAccessor("connected", &SmbConnectionWrap::GetConnected, nullptr),
@@ -126,7 +141,7 @@ bool SmbConnectionWrap::IsConnectionClosing() const {
 
 Napi::Value SmbConnectionWrap::RejectNotReady(Napi::Env env) const {
   auto deferred = Napi::Promise::Deferred::New(env);
-  deferred.Reject(CreateError("INVALID_STATE", "Connection is not ready", -EINVAL, 0));
+  deferred.Reject(CreateError("INVALID_STATE", "Connection is not ready", -EINVAL, 0, nullptr));
   return deferred.Promise();
 }
 
@@ -163,14 +178,64 @@ Napi::Object SmbConnectionWrap::CreateError(const std::string& code,
                                             const std::string& message,
                                             int status,
                                             int nterror,
+                                            const PendingOperation* operation,
                                             const std::string* path) const {
-  Napi::Error error = Napi::Error::New(Env(), message);
+  const uint64_t nowMs = CurrentTimeMs();
+  std::vector<PendingOperation*> activeOperations = SnapshotPendingOperations();
+  const PendingOperation* primaryOperation = operation;
+  if (primaryOperation == nullptr && path != nullptr) {
+    for (PendingOperation* operation : activeOperations) {
+      if (operation->path == *path) {
+        primaryOperation = operation;
+        break;
+      }
+    }
+  }
+
+  std::string formattedMessage = message;
+  if ((code == "TIMEOUT" || code == "CONNECTION" || code == "PROTOCOL") &&
+      !activeOperations.empty()) {
+    std::ostringstream stream;
+    stream << message << " [active=";
+    bool wroteAny = false;
+    if (primaryOperation != nullptr) {
+      stream << DescribePendingOperation(primaryOperation, nowMs);
+      wroteAny = true;
+    }
+    for (PendingOperation* operation : activeOperations) {
+      if (operation == primaryOperation) {
+        continue;
+      }
+      if (wroteAny) {
+        stream << "; ";
+      }
+      stream << DescribePendingOperation(operation, nowMs);
+      wroteAny = true;
+    }
+    if (wroteAny) {
+      stream << "]";
+      formattedMessage = stream.str();
+    }
+  }
+
+  Napi::Error error = Napi::Error::New(Env(), formattedMessage);
   Napi::Object value = error.Value();
   value.Set("code", Napi::String::New(Env(), code));
   value.Set("errno", Napi::Number::New(Env(), status));
   value.Set("nterror", Napi::Number::New(Env(), nterror));
   if (path != nullptr) {
     value.Set("path", Napi::String::New(Env(), *path));
+  }
+  if (primaryOperation != nullptr && !primaryOperation->action.empty()) {
+    value.Set("operation", Napi::String::New(Env(), primaryOperation->action));
+    value.Set(
+        "durationMs",
+        Napi::Number::New(
+            Env(),
+            static_cast<double>(nowMs - primaryOperation->started_at_ms)));
+  }
+  if (!activeOperations.empty()) {
+    value.Set("activeOperations", PendingOperationsToJs(primaryOperation, nowMs));
   }
   return value;
 }
@@ -235,6 +300,95 @@ int SmbConnectionWrap::LastNtError() const {
   return smb2_get_nterror(context_);
 }
 
+std::vector<SmbConnectionWrap::PendingOperation*> SmbConnectionWrap::SnapshotPendingOperations() const {
+  std::vector<PendingOperation*> operations;
+  operations.reserve(pending_.size());
+  for (PendingOperation* operation : pending_) {
+    operations.push_back(operation);
+  }
+  std::sort(
+      operations.begin(),
+      operations.end(),
+      [](const PendingOperation* left, const PendingOperation* right) {
+        if (left->started_at_ms != right->started_at_ms) {
+          return left->started_at_ms < right->started_at_ms;
+        }
+        return left->action < right->action;
+      });
+  return operations;
+}
+
+std::string SmbConnectionWrap::DescribePendingOperation(
+    const PendingOperation* operation,
+    uint64_t now_ms) const {
+  if (operation == nullptr) {
+    return "unknown";
+  }
+
+  std::ostringstream stream;
+  stream << (operation->action.empty() ? "pending" : operation->action);
+  if (!operation->path.empty()) {
+    stream << " path=" << operation->path;
+  }
+  if (!operation->extra_path.empty()) {
+    stream << " newPath=" << operation->extra_path;
+  }
+  if (operation->has_handle_id) {
+    stream << " handle=" << operation->handle_id;
+  }
+  stream << " ageMs=" << (now_ms - operation->started_at_ms);
+  return stream.str();
+}
+
+Napi::Array SmbConnectionWrap::PendingOperationsToJs(
+    const PendingOperation* primary,
+    uint64_t now_ms) const {
+  std::vector<PendingOperation*> operations = SnapshotPendingOperations();
+  Napi::Array array = Napi::Array::New(Env(), operations.size());
+  uint32_t index = 0;
+
+  auto appendOperation = [&](const PendingOperation* operation) {
+    Napi::Object entry = Napi::Object::New(Env());
+    entry.Set(
+        "action",
+        Napi::String::New(
+            Env(),
+            operation->action.empty() ? "pending" : operation->action));
+    if (!operation->path.empty()) {
+      entry.Set("path", Napi::String::New(Env(), operation->path));
+    }
+    if (!operation->extra_path.empty()) {
+      entry.Set("newPath", Napi::String::New(Env(), operation->extra_path));
+    }
+    if (operation->has_handle_id) {
+      entry.Set(
+          "handle",
+          Napi::Number::New(Env(), operation->handle_id));
+    }
+    entry.Set(
+        "durationMs",
+        Napi::Number::New(
+            Env(),
+            static_cast<double>(now_ms - operation->started_at_ms)));
+    entry.Set(
+        "summary",
+        Napi::String::New(Env(), DescribePendingOperation(operation, now_ms)));
+    array.Set(index++, entry);
+  };
+
+  if (primary != nullptr) {
+    appendOperation(primary);
+  }
+  for (PendingOperation* operation : operations) {
+    if (operation == primary) {
+      continue;
+    }
+    appendOperation(operation);
+  }
+
+  return array;
+}
+
 void SmbConnectionWrap::RejectPending(PendingOperation* operation,
                                       const std::string& code,
                                       const std::string& message,
@@ -244,7 +398,7 @@ void SmbConnectionWrap::RejectPending(PendingOperation* operation,
   if (operation->settled) {
     return;
   }
-  operation->deferred.Reject(CreateError(code, message, status, nterror, path));
+  operation->deferred.Reject(CreateError(code, message, status, nterror, operation, path));
   operation->settled = true;
 }
 
@@ -626,11 +780,13 @@ Napi::Value SmbConnectionWrap::Connect(const Napi::CallbackInfo& info) {
   owner->timeout_sec_ = static_cast<int>(timeout);
 
   auto* operation = new ConnectOperation(owner);
+  operation->action = "connect";
   operation->self = Napi::Persistent(object);
   operation->signing_required = signing == "required";
   operation->server = serverAddress;
   operation->share = share;
   operation->username = username;
+  operation->path = serverAddress + "/" + share;
 
   if (!owner->EnsureContext()) {
     operation->deferred.Reject(Napi::Error::New(env, "Failed to initialize libsmb2 context").Value());
@@ -696,6 +852,7 @@ void SmbConnectionWrap::OnConnectComplete(struct smb2_context* smb2, int status,
 Napi::Value SmbConnectionWrap::Disconnect(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   auto* operation = new PendingOperation(this);
+  operation->action = "disconnect";
 
   if (context_ == nullptr || !connected_) {
     operation->deferred.Resolve(env.Undefined());
@@ -765,6 +922,7 @@ Napi::Value SmbConnectionWrap::Stat(const Napi::CallbackInfo& info) {
   }
 
   auto* operation = new StatOperation(this);
+  operation->action = "stat";
   operation->path = info[0].As<Napi::String>().Utf8Value();
   if (!RegisterPending(operation)) {
     return operation->deferred.Promise();
@@ -814,6 +972,7 @@ Napi::Value SmbConnectionWrap::Open(const Napi::CallbackInfo& info) {
   }
 
   auto* operation = new OpenOperation(this);
+  operation->action = "open";
   operation->path = info[0].As<Napi::String>().Utf8Value();
   const int flags = info[1].As<Napi::Number>().Int32Value();
   if (!RegisterPending(operation)) {
@@ -876,7 +1035,7 @@ Napi::Value SmbConnectionWrap::Read(const Napi::CallbackInfo& info) {
   auto handleIt = file_handles_.find(handleId);
   if (handleIt == file_handles_.end()) {
     auto deferred = Napi::Promise::Deferred::New(env);
-    deferred.Reject(CreateError("INVALID_STATE", "Unknown file handle", -EBADF, 0));
+    deferred.Reject(CreateError("INVALID_STATE", "Unknown file handle", -EBADF, 0, nullptr));
     return deferred.Promise();
   }
 
@@ -890,11 +1049,15 @@ Napi::Value SmbConnectionWrap::Read(const Napi::CallbackInfo& info) {
   const uint32_t maxLength = smb2_get_max_read_size(context_);
   if (maxLength != 0 && length > maxLength) {
     auto deferred = Napi::Promise::Deferred::New(env);
-    deferred.Reject(CreateError("INVALID_STATE", "Requested read length exceeds server maximum", -EINVAL, 0));
+    deferred.Reject(CreateError("INVALID_STATE", "Requested read length exceeds server maximum", -EINVAL, 0, nullptr));
     return deferred.Promise();
   }
 
   auto* operation = new ReadOperation(this);
+  operation->action = "read";
+  operation->path = handleIt->second.path;
+  operation->handle_id = handleId;
+  operation->has_handle_id = true;
   operation->buffer.resize(length);
   if (!RegisterPending(operation)) {
     return operation->deferred.Promise();
@@ -952,7 +1115,7 @@ Napi::Value SmbConnectionWrap::Write(const Napi::CallbackInfo& info) {
   auto handleIt = file_handles_.find(handleId);
   if (handleIt == file_handles_.end()) {
     auto deferred = Napi::Promise::Deferred::New(env);
-    deferred.Reject(CreateError("INVALID_STATE", "Unknown file handle", -EBADF, 0));
+    deferred.Reject(CreateError("INVALID_STATE", "Unknown file handle", -EBADF, 0, nullptr));
     return deferred.Promise();
   }
 
@@ -967,11 +1130,15 @@ Napi::Value SmbConnectionWrap::Write(const Napi::CallbackInfo& info) {
   const uint32_t maxLength = smb2_get_max_write_size(context_);
   if (maxLength != 0 && data.ByteLength() > maxLength) {
     auto deferred = Napi::Promise::Deferred::New(env);
-    deferred.Reject(CreateError("INVALID_STATE", "Requested write length exceeds server maximum", -EINVAL, 0));
+    deferred.Reject(CreateError("INVALID_STATE", "Requested write length exceeds server maximum", -EINVAL, 0, nullptr));
     return deferred.Promise();
   }
 
   auto* operation = new WriteOperation(this);
+  operation->action = "write";
+  operation->path = handleIt->second.path;
+  operation->handle_id = handleId;
+  operation->has_handle_id = true;
   operation->buffer.assign(data.Data(), data.Data() + data.ByteLength());
   if (!RegisterPending(operation)) {
     return operation->deferred.Promise();
@@ -1029,7 +1196,7 @@ Napi::Value SmbConnectionWrap::Ftruncate(const Napi::CallbackInfo& info) {
   auto handleIt = file_handles_.find(handleId);
   if (handleIt == file_handles_.end()) {
     auto deferred = Napi::Promise::Deferred::New(env);
-    deferred.Reject(CreateError("INVALID_STATE", "Unknown file handle", -EBADF, 0));
+    deferred.Reject(CreateError("INVALID_STATE", "Unknown file handle", -EBADF, 0, nullptr));
     return deferred.Promise();
   }
 
@@ -1041,6 +1208,10 @@ Napi::Value SmbConnectionWrap::Ftruncate(const Napi::CallbackInfo& info) {
   }
 
   auto* operation = new HandleOperation(this, handleId);
+  operation->action = "ftruncate";
+  operation->path = handleIt->second.path;
+  operation->handle_id = handleId;
+  operation->has_handle_id = true;
   if (!RegisterPending(operation)) {
     return operation->deferred.Promise();
   }
@@ -1095,7 +1266,7 @@ Napi::Value SmbConnectionWrap::Close(const Napi::CallbackInfo& info) {
   auto handleIt = file_handles_.find(handleId);
   if (handleIt == file_handles_.end()) {
     auto deferred = Napi::Promise::Deferred::New(env);
-    deferred.Reject(CreateError("INVALID_STATE", "Unknown file handle", -EBADF, 0));
+    deferred.Reject(CreateError("INVALID_STATE", "Unknown file handle", -EBADF, 0, nullptr));
     return deferred.Promise();
   }
 
@@ -1103,6 +1274,10 @@ Napi::Value SmbConnectionWrap::Close(const Napi::CallbackInfo& info) {
   file_handles_.erase(handleIt);
 
   auto* operation = new HandleOperation(this, handleId);
+  operation->action = "close";
+  operation->path = handleIt->second.path;
+  operation->handle_id = handleId;
+  operation->has_handle_id = true;
   if (!RegisterPending(operation)) {
     return operation->deferred.Promise();
   }
@@ -1152,6 +1327,7 @@ Napi::Value SmbConnectionWrap::Mkdir(const Napi::CallbackInfo& info) {
     return env.Null();
   }
   auto* operation = new PendingOperation(this);
+  operation->action = "mkdir";
   operation->path = info[0].As<Napi::String>().Utf8Value();
   if (!RegisterPending(operation)) {
     return operation->deferred.Promise();
@@ -1176,6 +1352,7 @@ Napi::Value SmbConnectionWrap::Rmdir(const Napi::CallbackInfo& info) {
     return env.Null();
   }
   auto* operation = new PendingOperation(this);
+  operation->action = "rmdir";
   operation->path = info[0].As<Napi::String>().Utf8Value();
   if (!RegisterPending(operation)) {
     return operation->deferred.Promise();
@@ -1200,6 +1377,7 @@ Napi::Value SmbConnectionWrap::Unlink(const Napi::CallbackInfo& info) {
     return env.Null();
   }
   auto* operation = new PendingOperation(this);
+  operation->action = "unlink";
   operation->path = info[0].As<Napi::String>().Utf8Value();
   if (!RegisterPending(operation)) {
     return operation->deferred.Promise();
@@ -1251,8 +1429,10 @@ Napi::Value SmbConnectionWrap::Rename(const Napi::CallbackInfo& info) {
     return env.Null();
   }
   auto* operation = new RenameOperation(this);
+  operation->action = "rename";
   operation->path = info[0].As<Napi::String>().Utf8Value();
   operation->new_path = info[1].As<Napi::String>().Utf8Value();
+  operation->extra_path = operation->new_path;
   if (!RegisterPending(operation)) {
     return operation->deferred.Promise();
   }
@@ -1303,6 +1483,7 @@ Napi::Value SmbConnectionWrap::Opendir(const Napi::CallbackInfo& info) {
     return env.Null();
   }
   auto* operation = new OpenOperation(this);
+  operation->action = "opendir";
   operation->path = info[0].As<Napi::String>().Utf8Value();
   if (!RegisterPending(operation)) {
     return operation->deferred.Promise();
@@ -1363,7 +1544,7 @@ Napi::Value SmbConnectionWrap::Readdir(const Napi::CallbackInfo& info) {
   const uint32_t handleId = info[0].As<Napi::Number>().Uint32Value();
   auto handleIt = dir_handles_.find(handleId);
   if (handleIt == dir_handles_.end()) {
-    deferred.Reject(CreateError("INVALID_STATE", "Unknown directory handle", -EBADF, 0));
+    deferred.Reject(CreateError("INVALID_STATE", "Unknown directory handle", -EBADF, 0, nullptr));
     return deferred.Promise();
   }
 
@@ -1391,7 +1572,7 @@ Napi::Value SmbConnectionWrap::Closedir(const Napi::CallbackInfo& info) {
   const uint32_t handleId = info[0].As<Napi::Number>().Uint32Value();
   auto handleIt = dir_handles_.find(handleId);
   if (handleIt == dir_handles_.end()) {
-    deferred.Reject(CreateError("INVALID_STATE", "Unknown directory handle", -EBADF, 0));
+    deferred.Reject(CreateError("INVALID_STATE", "Unknown directory handle", -EBADF, 0, nullptr));
     return deferred.Promise();
   }
 
@@ -1399,6 +1580,17 @@ Napi::Value SmbConnectionWrap::Closedir(const Napi::CallbackInfo& info) {
   dir_handles_.erase(handleIt);
   deferred.Resolve(env.Undefined());
   return deferred.Promise();
+}
+
+Napi::Value SmbConnectionWrap::GetDebugState(const Napi::CallbackInfo& info) {
+  (void)info;
+  const uint64_t nowMs = CurrentTimeMs();
+  Napi::Object state = Napi::Object::New(Env());
+  state.Set("connected", Napi::Boolean::New(Env(), connected_));
+  state.Set("disconnecting", Napi::Boolean::New(Env(), disconnecting_));
+  state.Set("timeoutSec", Napi::Number::New(Env(), timeout_sec_));
+  state.Set("pendingOperations", PendingOperationsToJs(nullptr, nowMs));
+  return state;
 }
 
 Napi::Value SmbConnectionWrap::GetMaxReadSize(const Napi::CallbackInfo& info) {

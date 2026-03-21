@@ -4,6 +4,9 @@ export class SmbError extends Error {
   code?: string;
   errno?: number;
   nterror?: number;
+  operation?: string;
+  durationMs?: number;
+  activeOperations?: NativeErrorLike["activeOperations"];
   path?: string;
 
   constructor(message: string, options: NativeErrorLike = new Error(message)) {
@@ -12,6 +15,9 @@ export class SmbError extends Error {
     this.code = options.code;
     this.errno = options.errno;
     this.nterror = options.nterror;
+    this.operation = options.operation;
+    this.durationMs = options.durationMs;
+    this.activeOperations = options.activeOperations;
     this.path = options.path;
     if ("cause" in options) {
       (this as Error & { cause?: unknown }).cause = options.cause;

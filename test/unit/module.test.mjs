@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  DEFAULT_TIMEOUT_SEC,
   O_RDONLY,
   SmbConnection,
   SmbInvalidStateError
@@ -66,6 +67,21 @@ function createFakeNative(overrides = {}) {
     closedir() {
       return Promise.resolve();
     },
+    getDebugState() {
+      return {
+        connected: true,
+        disconnecting: false,
+        timeoutSec: DEFAULT_TIMEOUT_SEC,
+        pendingOperations: [
+          {
+            action: "read",
+            path: "sample-files\\patient.txt",
+            durationMs: 1234,
+            summary: "read path=sample-files\\patient.txt ageMs=1234"
+          }
+        ]
+      };
+    },
     getMaxReadSize() {
       return 65536;
     },
@@ -84,6 +100,20 @@ function createFakeNative(overrides = {}) {
 test("module exports the low-level API surface", () => {
   assert.equal(typeof SmbConnection, "function");
   assert.equal(typeof O_RDONLY, "number");
+  assert.equal(typeof DEFAULT_TIMEOUT_SEC, "number");
+});
+
+test("SmbConnection.connect validates timeoutSec on the JS boundary", async () => {
+  await assert.rejects(
+    SmbConnection.connect({
+      server: "192.168.1.5",
+      share: "sample-files",
+      username: "smb",
+      password: "password",
+      timeoutSec: -1
+    }),
+    (error) => error instanceof SmbInvalidStateError
+  );
 });
 
 test("SmbConnection normalizes share-relative paths before calling native methods", async () => {
@@ -101,6 +131,20 @@ test("SmbConnection normalizes share-relative paths before calling native method
   });
   assert.equal(state.lastMkdirPath, "cipher\\data");
   assert.equal(state.lastOpendirPath, "cipher\\data");
+});
+
+test("SmbConnection exposes connection debug state", () => {
+  const { connection } = createFakeNative();
+  const state = connection.getDebugState();
+
+  assert.equal(state.connected, true);
+  assert.equal(state.disconnecting, false);
+  assert.equal(state.timeoutSec, DEFAULT_TIMEOUT_SEC);
+  assert.equal(state.pendingOperations[0]?.action, "read");
+  assert.match(
+    state.pendingOperations[0]?.summary ?? "",
+    /sample-files\\patient\.txt/
+  );
 });
 
 test("SmbConnection validates bigint offsets and lengths on the JS boundary", () => {

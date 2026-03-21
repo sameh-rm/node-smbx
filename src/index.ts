@@ -3,6 +3,7 @@ import { nativeBinding } from "./native.js";
 import { normalizeSmbPath } from "./path.js";
 
 import type {
+  ConnectionDebugState,
   ConnectOptions,
   DirEntry,
   DirHandle,
@@ -22,6 +23,7 @@ export const O_RDWR = nativeBinding.constants.O_RDWR;
 export const O_CREAT = nativeBinding.constants.O_CREAT;
 export const O_EXCL = nativeBinding.constants.O_EXCL;
 export const O_TRUNC = nativeBinding.constants.O_TRUNC;
+export const DEFAULT_TIMEOUT_SEC = 30;
 
 function invalidStateError(message: string, path?: string): SmbInvalidStateError {
   const nativeLike: NativeErrorLike = Object.assign(new Error(message), {
@@ -73,6 +75,19 @@ function validateData(data: Buffer | Uint8Array): void {
   }
 }
 
+function normalizeConnectOptions(options: ConnectOptions): ConnectOptions {
+  if (options.timeoutSec === undefined) {
+    return {
+      ...options,
+      timeoutSec: DEFAULT_TIMEOUT_SEC
+    };
+  }
+  if (!Number.isInteger(options.timeoutSec) || options.timeoutSec < 0) {
+    throw invalidStateError("timeoutSec must be a non-negative integer");
+  }
+  return options;
+}
+
 export class SmbConnection {
   #native: NativeSmbConnection;
 
@@ -97,7 +112,9 @@ export class SmbConnection {
       if (typeof options.password !== "string") {
         throw invalidStateError("password must be a string");
       }
-      const nativeConnection = await nativeBinding.SmbConnection.connect(options);
+      const nativeConnection = await nativeBinding.SmbConnection.connect(
+        normalizeConnectOptions(options)
+      );
       return new SmbConnection(nativeConnection);
     } catch (error) {
       throw toSmbError(error);
@@ -209,6 +226,10 @@ export class SmbConnection {
     return this.#native.closedir(handle).catch((error) => {
       throw toSmbError(error);
     });
+  }
+
+  getDebugState(): ConnectionDebugState {
+    return this.#native.getDebugState();
   }
 
   getMaxReadSize(): number {

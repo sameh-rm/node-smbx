@@ -32,7 +32,12 @@ private:
     SmbConnectionWrap* owner;
     Napi::Promise::Deferred deferred;
     bool settled;
+    uint64_t started_at_ms;
+    std::string action;
     std::string path;
+    std::string extra_path;
+    uint32_t handle_id;
+    bool has_handle_id;
   };
 
   struct ConnectOperation final : PendingOperation {
@@ -100,10 +105,13 @@ private:
   void QueuePendingForCleanup(PendingOperation* keep = nullptr);
   void DrainDeferredCleanupOperations();
 
-  Napi::Object CreateError(const std::string& code, const std::string& message, int status, int nterror, const std::string* path = nullptr) const;
+  Napi::Object CreateError(const std::string& code, const std::string& message, int status, int nterror, const PendingOperation* operation = nullptr, const std::string* path = nullptr) const;
   std::string ClassifyError(int status, int nterror, const std::string& message, bool signing_required = false) const;
   std::string LastErrorMessage() const;
   int LastNtError() const;
+  std::vector<PendingOperation*> SnapshotPendingOperations() const;
+  std::string DescribePendingOperation(const PendingOperation* operation, uint64_t now_ms) const;
+  Napi::Array PendingOperationsToJs(const PendingOperation* primary, uint64_t now_ms) const;
 
   void StartPoll(t_socket fd);
   void StopPoll();
@@ -147,6 +155,7 @@ private:
   Napi::Value Opendir(const Napi::CallbackInfo& info);
   Napi::Value Readdir(const Napi::CallbackInfo& info);
   Napi::Value Closedir(const Napi::CallbackInfo& info);
+  Napi::Value GetDebugState(const Napi::CallbackInfo& info);
   Napi::Value GetMaxReadSize(const Napi::CallbackInfo& info);
   Napi::Value GetMaxWriteSize(const Napi::CallbackInfo& info);
   Napi::Value GetConnected(const Napi::CallbackInfo& info);
