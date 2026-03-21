@@ -111,3 +111,80 @@ test("integration: basic file and directory operations", { skip: !hasCredentials
     }
   }
 });
+
+test("integration: operations reject when disconnecting or disconnected", { skip: !hasCredentials }, async () => {
+  const connection = await connect();
+  const rootDir = `node-smbx-${randomUUID()}`;
+  const originalPath = `${rootDir}/state.txt`;
+  const renamedPath = `${rootDir}/state-renamed.txt`;
+  let fileHandle = null;
+  let dirHandle = null;
+
+  try {
+    await connection.mkdir(rootDir);
+    fileHandle = await connection.open(originalPath, O_CREAT | O_RDWR | O_TRUNC);
+    dirHandle = await connection.opendir(rootDir);
+
+    const disconnectPromise = connection.disconnect();
+
+    await assert.rejects(connection.read(fileHandle, 0n, 1), (error) => {
+      assert.ok(error instanceof SmbInvalidStateError);
+      return true;
+    });
+
+    await assert.rejects(connection.write(fileHandle, new Uint8Array([1]), 0n), (error) => {
+      assert.ok(error instanceof SmbInvalidStateError);
+      return true;
+    });
+
+    await assert.rejects(connection.ftruncate(fileHandle, 0n), (error) => {
+      assert.ok(error instanceof SmbInvalidStateError);
+      return true;
+    });
+
+    await assert.rejects(connection.close(fileHandle), (error) => {
+      assert.ok(error instanceof SmbInvalidStateError);
+      return true;
+    });
+
+    await assert.rejects(connection.readdir(dirHandle), (error) => {
+      assert.ok(error instanceof SmbInvalidStateError);
+      return true;
+    });
+
+    await assert.rejects(connection.closedir(dirHandle), (error) => {
+      assert.ok(error instanceof SmbInvalidStateError);
+      return true;
+    });
+
+    await assert.rejects(connection.rename(originalPath, renamedPath), (error) => {
+      assert.ok(error instanceof SmbInvalidStateError);
+      return true;
+    });
+
+    await assert.rejects(connection.mkdir(`${rootDir}/nested`), (error) => {
+      assert.ok(error instanceof SmbInvalidStateError);
+      return true;
+    });
+
+    await disconnectPromise;
+    assert.equal(connection.connected, false);
+
+    await assert.rejects(connection.unlink(originalPath), (error) => {
+      assert.ok(error instanceof SmbInvalidStateError);
+      return true;
+    });
+  } finally {
+    if (connection.connected) {
+      await connection.disconnect().catch(() => {});
+    }
+    const cleanup = await connect().catch(() => null);
+    if (cleanup) {
+      await cleanup.unlink(renamedPath).catch(() => {});
+      await cleanup.unlink(originalPath).catch(() => {});
+      await cleanup.rmdir(`${rootDir}/nested`).catch(() => {});
+      await cleanup.rmdir(rootDir).catch(() => {});
+      await cleanup.disconnect().catch(() => {});
+    }
+  }
+});

@@ -90,6 +90,8 @@ private:
   };
 
   bool EnsureContext();
+  bool IsConnectionReady() const;
+  Napi::Value RejectNotReady(Napi::Env env) const;
   void RegisterPending(PendingOperation* operation);
   void FinishPending(PendingOperation* operation);
   void RejectPending(PendingOperation* operation, const std::string& code, const std::string& message, int status, int nterror, const std::string* path = nullptr);

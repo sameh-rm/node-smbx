@@ -112,6 +112,16 @@ bool SmbConnectionWrap::EnsureContext() {
   return true;
 }
 
+bool SmbConnectionWrap::IsConnectionReady() const {
+  return context_ != nullptr && connected_ && !disconnecting_;
+}
+
+Napi::Value SmbConnectionWrap::RejectNotReady(Napi::Env env) const {
+  auto deferred = Napi::Promise::Deferred::New(env);
+  deferred.Reject(CreateError("INVALID_STATE", "Connection is not ready", -EINVAL, 0));
+  return deferred.Promise();
+}
+
 void SmbConnectionWrap::RegisterPending(PendingOperation* operation) {
   pending_.insert(operation);
   StartServiceTimer();
@@ -618,10 +628,8 @@ void SmbConnectionWrap::OnDisconnectComplete(struct smb2_context* smb2, int stat
 
 Napi::Value SmbConnectionWrap::Stat(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  if (context_ == nullptr || !connected_ || disconnecting_) {
-    auto deferred = Napi::Promise::Deferred::New(env);
-    deferred.Reject(CreateError("INVALID_STATE", "Connection is not ready", -EINVAL, 0));
-    return deferred.Promise();
+  if (!IsConnectionReady()) {
+    return RejectNotReady(env);
   }
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "stat(path) requires a string path").ThrowAsJavaScriptException();
@@ -667,10 +675,8 @@ void SmbConnectionWrap::OnStatComplete(struct smb2_context* smb2, int status, vo
 
 Napi::Value SmbConnectionWrap::Open(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  if (context_ == nullptr || !connected_ || disconnecting_) {
-    auto deferred = Napi::Promise::Deferred::New(env);
-    deferred.Reject(CreateError("INVALID_STATE", "Connection is not ready", -EINVAL, 0));
-    return deferred.Promise();
+  if (!IsConnectionReady()) {
+    return RejectNotReady(env);
   }
   if (info.Length() < 2 || !info[0].IsString() || !info[1].IsNumber()) {
     Napi::TypeError::New(env, "open(path, flags) requires a string path and numeric flags").ThrowAsJavaScriptException();
@@ -726,6 +732,9 @@ void SmbConnectionWrap::OnOpenComplete(struct smb2_context* smb2, int status, vo
 
 Napi::Value SmbConnectionWrap::Read(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (!IsConnectionReady()) {
+    return RejectNotReady(env);
+  }
   if (info.Length() < 3 || !info[0].IsNumber() || !info[1].IsBigInt() || !info[2].IsNumber()) {
     Napi::TypeError::New(env, "read(handle, offset, length) requires number, bigint, number").ThrowAsJavaScriptException();
     return env.Null();
@@ -792,6 +801,9 @@ void SmbConnectionWrap::OnReadComplete(struct smb2_context* smb2, int status, vo
 
 Napi::Value SmbConnectionWrap::Write(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (!IsConnectionReady()) {
+    return RejectNotReady(env);
+  }
   if (info.Length() < 3 || !info[0].IsNumber() || !info[1].IsTypedArray() || !info[2].IsBigInt()) {
     Napi::TypeError::New(env, "write(handle, data, offset) requires number, Uint8Array, bigint").ThrowAsJavaScriptException();
     return env.Null();
@@ -859,6 +871,9 @@ void SmbConnectionWrap::OnWriteComplete(struct smb2_context* smb2, int status, v
 
 Napi::Value SmbConnectionWrap::Ftruncate(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (!IsConnectionReady()) {
+    return RejectNotReady(env);
+  }
   if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsBigInt()) {
     Napi::TypeError::New(env, "ftruncate(handle, length) requires number and bigint").ThrowAsJavaScriptException();
     return env.Null();
@@ -915,6 +930,9 @@ void SmbConnectionWrap::OnFtruncateComplete(struct smb2_context* smb2, int statu
 
 Napi::Value SmbConnectionWrap::Close(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (!IsConnectionReady()) {
+    return RejectNotReady(env);
+  }
   if (info.Length() < 1 || !info[0].IsNumber()) {
     Napi::TypeError::New(env, "close(handle) requires a numeric handle").ThrowAsJavaScriptException();
     return env.Null();
@@ -966,6 +984,9 @@ void SmbConnectionWrap::OnCloseComplete(struct smb2_context* smb2, int status, v
 
 Napi::Value SmbConnectionWrap::Mkdir(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (!IsConnectionReady()) {
+    return RejectNotReady(env);
+  }
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "mkdir(path) requires a string path").ThrowAsJavaScriptException();
     return env.Null();
@@ -985,6 +1006,9 @@ Napi::Value SmbConnectionWrap::Mkdir(const Napi::CallbackInfo& info) {
 
 Napi::Value SmbConnectionWrap::Rmdir(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (!IsConnectionReady()) {
+    return RejectNotReady(env);
+  }
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "rmdir(path) requires a string path").ThrowAsJavaScriptException();
     return env.Null();
@@ -1004,6 +1028,9 @@ Napi::Value SmbConnectionWrap::Rmdir(const Napi::CallbackInfo& info) {
 
 Napi::Value SmbConnectionWrap::Unlink(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (!IsConnectionReady()) {
+    return RejectNotReady(env);
+  }
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "unlink(path) requires a string path").ThrowAsJavaScriptException();
     return env.Null();
@@ -1044,6 +1071,9 @@ void SmbConnectionWrap::OnPathComplete(struct smb2_context* smb2, int status, vo
 
 Napi::Value SmbConnectionWrap::Rename(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (!IsConnectionReady()) {
+    return RejectNotReady(env);
+  }
   if (info.Length() < 2 || !info[0].IsString() || !info[1].IsString()) {
     Napi::TypeError::New(env, "rename(oldPath, newPath) requires two string paths").ThrowAsJavaScriptException();
     return env.Null();
@@ -1085,6 +1115,9 @@ void SmbConnectionWrap::OnRenameComplete(struct smb2_context* smb2, int status, 
 
 Napi::Value SmbConnectionWrap::Opendir(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (!IsConnectionReady()) {
+    return RejectNotReady(env);
+  }
   if (info.Length() < 1 || !info[0].IsString()) {
     Napi::TypeError::New(env, "opendir(path) requires a string path").ThrowAsJavaScriptException();
     return env.Null();
@@ -1137,6 +1170,9 @@ void SmbConnectionWrap::OnOpendirComplete(struct smb2_context* smb2, int status,
 
 Napi::Value SmbConnectionWrap::Readdir(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (!IsConnectionReady()) {
+    return RejectNotReady(env);
+  }
   if (info.Length() < 1 || !info[0].IsNumber()) {
     Napi::TypeError::New(env, "readdir(handle) requires a numeric handle").ThrowAsJavaScriptException();
     return env.Null();
@@ -1162,6 +1198,9 @@ Napi::Value SmbConnectionWrap::Readdir(const Napi::CallbackInfo& info) {
 
 Napi::Value SmbConnectionWrap::Closedir(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (!IsConnectionReady()) {
+    return RejectNotReady(env);
+  }
   if (info.Length() < 1 || !info[0].IsNumber()) {
     Napi::TypeError::New(env, "closedir(handle) requires a numeric handle").ThrowAsJavaScriptException();
     return env.Null();
