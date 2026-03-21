@@ -4,6 +4,7 @@
 #include <uv.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -60,7 +61,8 @@ private:
 
   struct ReadOperation final : PendingOperation {
     explicit ReadOperation(SmbConnectionWrap* owner);
-    std::vector<uint8_t> buffer;
+    std::unique_ptr<uint8_t[]> buffer;
+    size_t buffer_length;
   };
 
   struct WriteOperation final : PendingOperation {

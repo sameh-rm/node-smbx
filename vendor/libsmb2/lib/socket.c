@@ -118,6 +118,10 @@
  * Since the smb is most likely used on local network, use an aggressive
  * timeout of 100ms. */
 #define HAPPY_EYEBALLS_TIMEOUT 100
+/* Yield back to libuv after a small burst so one readable/writable callback
+ * does not monopolize the Node event loop under large SMB backlogs. */
+#define SMB2_SERVICE_MAX_READ_LOOPS 4
+#define SMB2_SERVICE_MAX_WRITE_LOOPS 4
 #if !defined(HAVE_LINGER)
 struct linger
 {
@@ -225,6 +229,7 @@ int
 smb2_write_to_socket(struct smb2_context *smb2)
 {
         struct smb2_pdu *pdu;
+        int service_loops = 0;
 
         if (!SMB2_VALID_SOCKET(smb2->fd)) {
                 smb2_set_error(smb2, "trying to write but not connected");
@@ -329,6 +334,11 @@ smb2_write_to_socket(struct smb2_context *smb2)
                                 }
                                 pdu = tmp_pdu;
                         }
+                }
+
+                service_loops++;
+                if (service_loops >= SMB2_SERVICE_MAX_WRITE_LOOPS) {
+                        return 0;
                 }
         }
         return 0;
@@ -886,6 +896,7 @@ static int
 smb2_read_from_socket(struct smb2_context *smb2)
 {
         int count;
+        int service_loops = 0;
 
         while(1) {
                 /* initialize the input vectors to the spl and the header
@@ -911,6 +922,11 @@ smb2_read_from_socket(struct smb2_context *smb2)
                 }
                 if (count) {
                         return count;
+                }
+
+                service_loops++;
+                if (service_loops >= SMB2_SERVICE_MAX_READ_LOOPS) {
+                        return 0;
                 }
         }
 }

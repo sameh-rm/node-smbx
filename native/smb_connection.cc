@@ -45,7 +45,7 @@ SmbConnectionWrap::OpenOperation::OpenOperation(SmbConnectionWrap* owner_in)
     : PendingOperation(owner_in) {}
 
 SmbConnectionWrap::ReadOperation::ReadOperation(SmbConnectionWrap* owner_in)
-    : PendingOperation(owner_in) {}
+    : PendingOperation(owner_in), buffer(nullptr), buffer_length(0) {}
 
 SmbConnectionWrap::WriteOperation::WriteOperation(SmbConnectionWrap* owner_in)
     : PendingOperation(owner_in) {}
@@ -1058,11 +1058,19 @@ Napi::Value SmbConnectionWrap::Read(const Napi::CallbackInfo& info) {
   operation->path = handleIt->second.path;
   operation->handle_id = handleId;
   operation->has_handle_id = true;
-  operation->buffer.resize(length);
+  operation->buffer = std::make_unique<uint8_t[]>(length == 0 ? 1 : length);
+  operation->buffer_length = length;
   if (!RegisterPending(operation)) {
     return operation->deferred.Promise();
   }
-  const int rc = smb2_pread_async(context_, handleIt->second.handle, operation->buffer.data(), length, offset, &SmbConnectionWrap::OnReadComplete, operation);
+  const int rc = smb2_pread_async(
+      context_,
+      handleIt->second.handle,
+      operation->buffer.get(),
+      length,
+      offset,
+      &SmbConnectionWrap::OnReadComplete,
+      operation);
   if (rc < 0) {
     const std::string message = LastErrorMessage();
     const int nterror = LastNtError();
@@ -1096,7 +1104,14 @@ void SmbConnectionWrap::OnReadComplete(struct smb2_context* smb2, int status, vo
     return;
   }
 
-  operation->deferred.Resolve(Napi::Buffer<uint8_t>::Copy(owner->Env(), operation->buffer.data(), static_cast<size_t>(status)));
+  uint8_t* data = operation->buffer.release();
+  operation->deferred.Resolve(Napi::Buffer<uint8_t>::New(
+      owner->Env(),
+      data,
+      static_cast<size_t>(status),
+      [](Napi::Env, uint8_t* buffer) {
+        delete[] buffer;
+      }));
   operation->settled = true;
   owner->FinishPending(operation);
 }
