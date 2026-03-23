@@ -2,6 +2,7 @@
   "name": "node-smbx",
   "version": "0.3.0",
   "description": "Low-level Node-API SMB binding backed by libsmb2.",
+  "author": "sameh-rm (https://github.com/sameh-rm)",
   "license": "MIT AND LGPL-2.1-or-later",
   "type": "module",
   "main": "./dist/index.js",
